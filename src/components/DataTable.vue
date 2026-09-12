@@ -2,9 +2,11 @@
   <div
     ref="tableContainerRef"
     class="data-table"
+    :class="{ 'data-table--row-click-expand': expandRowByClick && hasExpandSlot }"
     :style="tableStyle"
   >
-    <div v-if="hasToolbar" class="data-table-toolbar">
+    <!-- 槽位存在性不具响应性：数据异步加载后才出现的 toolbar 插槽若走 computed 会被永久缓存为 false，必须模板内直接判 -->
+    <div v-if="filters.length > 0 || $slots.toolbar || $slots.toolbarExtra" class="data-table-toolbar">
       <slot v-if="$slots.toolbar" name="toolbar" />
       <div v-else class="data-table-filter-bar">
         <template v-for="f in filters" :key="f.key">
@@ -71,12 +73,18 @@
         :locale="{ emptyText }"
         :expandable="expandable"
         :row-selection="rowSelection"
+        :expand-row-by-click="expandRowByClick"
+        :expand-column-width="hasExpandSlot ? EXPAND_COL_W : undefined"
         size="small"
         @resize-column="handleResizeColumn"
         @change="onTableChange"
+        @expand="handleTableExpand"
       >
         <template #bodyCell="scope">
           <slot name="bodyCell" v-bind="scope" />
+        </template>
+        <template v-if="$slots.headerCell" #headerCell="scope">
+          <slot name="headerCell" v-bind="scope" />
         </template>
         <template v-if="$slots.expandedRowRender" #expandedRowRender="scope">
           <slot name="expandedRowRender" v-bind="scope" />
@@ -100,12 +108,18 @@
         :locale="{ emptyText }"
         :expandable="expandable"
         :row-selection="rowSelection"
+        :expand-row-by-click="expandRowByClick"
+        :expand-column-width="hasExpandSlot ? EXPAND_COL_W : undefined"
         size="small"
         @resize-column="handleResizeColumn"
         @change="onTableChange"
+        @expand="handleTableExpand"
       >
         <template #bodyCell="scope">
           <slot name="bodyCell" v-bind="scope" />
+        </template>
+        <template v-if="$slots.headerCell" #headerCell="scope">
+          <slot name="headerCell" v-bind="scope" />
         </template>
         <template v-if="$slots.expandedRowRender" #expandedRowRender="scope">
           <slot name="expandedRowRender" v-bind="scope" />
@@ -157,6 +171,8 @@ const props = withDefaults(defineProps<{
   loading?: boolean
   pagination?: Record<string, any> | boolean
   expandable?: Record<string, any>
+  /** 整行点击展开（配合 #expandedRowRender 使用，透传 antd expandRowByClick） */
+  expandRowByClick?: boolean
   rowSelection?: Record<string, any>
   filters?: DataTableFilter[]
   query?: Record<string, any>
@@ -174,12 +190,30 @@ const props = withDefaults(defineProps<{
   fillWidth: true,
   emptyText: '暂无数据',
   storageKey: '',
+  expandRowByClick: false,
 })
 
 const emit = defineEmits<{
   'update:query': [q: Record<string, any>]
   'change': [pagination: unknown, filters: unknown, sorter: unknown]
+  'expand': [expanded: boolean, record: Record<string, any>]
 }>()
+
+/** 展开图标列宽度：a-table 注入列无宽度，与强制表宽机制（--dt-col-sum）配合需显式定宽 */
+const EXPAND_COL_W = 40
+/** 勾选列（rowSelection）默认宽度，同展开列：注入列不在 columns 里，必须计入强制表宽 */
+const SELECTION_COL_W = 32
+
+const hasExpandSlot = computed(() => !!useSlots().expandedRowRender)
+const selectionColW = computed(() => {
+  const rs = props.rowSelection as Record<string, unknown> | undefined
+  if (!rs) return 0
+  return typeof rs.columnWidth === 'number' ? rs.columnWidth : SELECTION_COL_W
+})
+
+function handleTableExpand(expanded: boolean, record: Record<string, any>): void {
+  emit('expand', expanded, record)
+}
 
 // ── 列宽拖拽（localStorage 持久化）────────────────────────────
 const STORAGE_PREFIX = 'angineer-datatable-cols:'
@@ -235,13 +269,15 @@ watch(() => props.columns, (cols) => {
 
 const effectiveColumns = computed<DataTableColumn[]>(() =>
   props.columns.map((col) => {
+    // resizable 默认 true（未显式设为 false 即启用）
+    const resizable = col.resizable === false ? false : true
     if (!col.key) {
       // 无 key 列按配置宽度渲染，缺省给默认宽度兜底（避免 table-layout: fixed 下塌缩为 0）
-      return typeof col.width === 'number' ? col : { ...col, width: 120 }
+      return typeof col.width === 'number' ? { ...col, resizable } : { ...col, width: 120, resizable }
     }
     const virtual = internalWidths[col.key] ?? (typeof col.width === 'number' ? col.width : 120)
     const min = typeof col.minWidth === 'number' ? col.minWidth : 50
-    return { ...col, width: Math.max(virtual, min), minWidth: col.minWidth }
+    return { ...col, width: Math.max(virtual, min), minWidth: col.minWidth, resizable }
   }),
 )
 
@@ -283,43 +319,120 @@ function viewportWidth(): number {
 }
 
 const contentWidth = computed(() =>
-  effectiveColumns.value.reduce((sum, col) => sum + (typeof col.width === 'number' ? col.width : 0), 0),
+  effectiveColumns.value.reduce((sum, col) => sum + (typeof col.width === 'number' ? col.width : 0), 0)
+  // 展开图标列/勾选列由 a-table 注入、不在 columns 内，强制表宽必须把它们算进来，
+  // 否则会被 fixed 布局挤到 0（展开列）或表宽恒定超出容器一个勾选列宽（实踩 32px 横向滚动）
+  + (hasExpandSlot.value ? EXPAND_COL_W : 0) + selectionColW.value,
 )
 /** 表宽精确等于列宽总和：窄表不被浏览器等比拉伸、宽表保持溢出滚动，同时列宽严格遵循配置/拖拽结果 */
 const tableStyle = computed(() => ({ '--dt-col-sum': `${contentWidth.value}px` }))
 const scrollX = computed(() => Math.max(containerWidth.value, contentWidth.value))
 
+/** 取整后把 ±1px 舍入误差从最宽的列起逐列修正，保证参与列总宽精确等于预算（防多列取整累积出横向滚动条） */
+function applyScaledWidths(keys: string[], computed: Record<string, number>, budget: number): void {
+  let sum = 0
+  for (const k of keys) {
+    internalWidths[k] = Math.round(computed[k])
+    sum += internalWidths[k]
+  }
+  let diff = Math.round(budget) - sum
+  if (!Number.isFinite(diff) || diff === 0) return
+  const order = keys.slice().sort((a, b) => internalWidths[b] - internalWidths[a])
+  for (const k of order) {
+    if (diff === 0) return
+    const min = columnMinWidths[k] ?? 50
+    if (diff > 0) {
+      internalWidths[k] += 1
+      diff -= 1
+    } else if (internalWidths[k] - 1 >= min) {
+      internalWidths[k] -= 1
+      diff += 1
+    }
+  }
+}
+
 function fillWidthToContainer(): void {
-  if (!props.fillWidth || hasStoredLayout.value || userAdjusted.value) return
+  if (!props.fillWidth || userAdjusted.value) return
   const el = tableContainerRef.value
   if (!el) return
   const width = viewportWidth()
   if (!width) return
-  // 内容已宽于容器（横向滚动中）时不再缩放
   const total = contentWidth.value
   if (total === 0) return
-  if (!filledToContainer.value && width <= total) return
 
-  // 弹性列（flex: true）吸收剩余宽度；未声明弹性列时退化为所有可拖拽列均分
+  // 弹性列（flex: true）吸收宽度差；未声明弹性列时退化为所有可拖拽列按比例分摊
   const flexCols = effectiveColumns.value.filter((c) => c.flex === true && c.resizable && c.key)
   const scaleTargets = flexCols.length > 0
     ? flexCols
     : effectiveColumns.value.filter((c) => c.resizable && c.key && !c.fixed)
   const scaleKeys = scaleTargets.map((c) => c.key as string)
+  if (scaleKeys.length === 0) return
   const scaleBase = scaleKeys.reduce((sum, k) => sum + (internalWidths[k] ?? 0), 0)
   if (scaleBase === 0) return
 
+  // 展开图标列/勾选列不在 columns 里但占宽度，分摊时必须先扣掉，否则总宽超容器出横向滚动
+  const auxTotal = (hasExpandSlot.value ? EXPAND_COL_W : 0) + selectionColW.value
   const fixedTotal = effectiveColumns.value.reduce((sum, col) => {
     const key = col.key
     if (key && scaleKeys.includes(key)) return sum
     return sum + (typeof col.width === 'number' ? col.width : 0)
-  }, 0)
+  }, 0) + auxTotal
+
+  // 双向自适应：宽则拉伸、窄则收缩（各列不低于 minWidth）
+  const minScale = scaleKeys.reduce((sum, k) => sum + (columnMinWidths[k] ?? 50), 0)
   const leftover = width - fixedTotal
-  if (leftover <= 0) return
-  const scale = leftover / scaleBase
-  for (const key of scaleKeys) {
-    internalWidths[key] = Math.max(columnMinWidths[key] ?? 50, Math.round((internalWidths[key] ?? 0) * scale))
+
+  if (width >= total || leftover >= minScale) {
+    // 容器更宽，或缺口在弹性列自身余量内：维持原语义，仅缩放列参与
+    const scale = leftover / scaleBase
+    const computed: Record<string, number> = {}
+    for (const key of scaleKeys) {
+      computed[key] = Math.max(columnMinWidths[key] ?? 50, (internalWidths[key] ?? 0) * scale)
+    }
+    applyScaledWidths(scaleKeys, computed, leftover)
+    filledToContainer.value = true
+    return
   }
+
+  // 容器放不下且弹性列兜不住：全部非 fixed 可收缩列按余量分摊收缩（原行为只缩弹性列，
+  // 一列余量不足即整表放弃 → 基础列宽总和大于容器时横向滚动条永存，夜间维护表实踩）。
+  // 触底 minWidth 的列退出分摊、剩余缺口重新分给未触底列；全部触底仍放不下才允许横向滚动
+  const shrinkKeys = effectiveColumns.value
+    .filter((c) => c.resizable && c.key && !c.fixed)
+    .map((c) => c.key as string)
+  if (shrinkKeys.length === 0) return
+  const nonShrinkTotal = effectiveColumns.value.reduce((sum, col) => {
+    const key = col.key
+    if (key && shrinkKeys.includes(key)) return sum
+    return sum + (typeof col.width === 'number' ? col.width : 0)
+  }, 0) + auxTotal
+  const budget = width - nonShrinkTotal
+  const minTotal = shrinkKeys.reduce((sum, k) => sum + (columnMinWidths[k] ?? 50), 0)
+  if (budget < minTotal) return
+  const w: Record<string, number> = {}
+  for (const k of shrinkKeys) w[k] = internalWidths[k] ?? 0
+  const floored = new Set<string>()
+  for (let iter = 0; iter <= shrinkKeys.length; iter++) {
+    const active = shrinkKeys.filter((k) => !floored.has(k))
+    if (active.length === 0) break
+    const flooredSum = shrinkKeys.reduce((sum, k) => (floored.has(k) ? sum + w[k] : sum), 0)
+    const activeBase = active.reduce((sum, k) => sum + w[k], 0)
+    if (activeBase <= 0) break
+    const scale = (budget - flooredSum) / activeBase
+    let anyClamped = false
+    for (const k of active) {
+      const min = columnMinWidths[k] ?? 50
+      if (w[k] * scale <= min) {
+        w[k] = min
+        floored.add(k)
+        anyClamped = true
+      } else {
+        w[k] = w[k] * scale
+      }
+    }
+    if (!anyClamped) break
+  }
+  applyScaledWidths(shrinkKeys, w, budget)
   filledToContainer.value = true
 }
 
@@ -343,25 +456,30 @@ onBeforeUnmount(() => {
   tableResizeObserver?.disconnect()
 })
 
-// ── 分页约定：默认 showSizeChanger=false + showTotal ──
+// ── 分页约定：受控模式，showSizeChanger 默认 true ──
+const internalPagination = reactive<Record<string, any>>({})
+
 const paginationProps = computed(() => {
   if (!props.pagination || typeof props.pagination !== 'object') return false
   return {
-    showSizeChanger: false,
+    showSizeChanger: true,
     ...props.pagination,
+    ...internalPagination,
     showTotal: props.pagination.showTotal ?? ((t: number) => `共 ${t} 条`),
   }
 })
 
 function onTableChange(pagination: unknown, filters: unknown, sorter: unknown): void {
+  // 受控分页：回写当前页码和每页条数
+  if (pagination && typeof pagination === 'object') {
+    const p = pagination as Record<string, any>
+    if (p.current !== undefined) internalPagination.current = p.current
+    if (p.pageSize !== undefined) internalPagination.pageSize = p.pageSize
+  }
   emit('change', pagination, filters, sorter)
 }
 
 // ── 筛选栏：配置驱动，v-model:query ──
-const hasToolbar = computed(() =>
-  props.filters.length > 0 || !!(useSlots().toolbar || useSlots().toolbarExtra),
-)
-
 const localQuery = reactive<Record<string, any>>({})
 
 watch(() => props.query, (q) => {
@@ -435,9 +553,26 @@ function emitQuery(): void {
   display: none;
 }
 
-// 表头居中
+// 表头居中。必须 !important：antd cssinjs 给 th 注入 text-align:start 的特异性
+// 高于 scoped 编译产物（实测 computed 为 start），常规覆盖无效——只影响表头对齐，无副作用面。
 .data-table__table :deep(th) {
+  text-align: center !important;
+}
+
+// 单元格内容默认居中（表头与内容一致）。用 td.ant-table-cell 提升特异性盖过 antd 默认样式；
+// 不带 !important，这样列级 column.align（antd 写在 td 内联样式上）仍能覆盖成左对齐/右对齐。
+.data-table__table :deep(td.ant-table-cell) {
   text-align: center;
+}
+
+// 整行热区展开：行级指针光标提示可点击
+.data-table--row-click-expand :deep(.ant-table-row) {
+  cursor: pointer;
+}
+
+// 分页栏无背景底色
+:deep(.ant-table-pagination) {
+  background: transparent !important;
 }
 
 </style>
